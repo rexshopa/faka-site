@@ -31,7 +31,11 @@ process.on('unhandledRejection', console.error);
 process.on('uncaughtException', console.error);
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages, // ✅ 讓機器人接到訊息事件（用來續命）
+  ],
   partials: [Partials.Channel],
 });
 
@@ -219,6 +223,31 @@ function scheduleAutoClose(channel) {
   closeTimers.set(channel.id, t);
 }
 
+async function bumpTicketActivity(channel) {
+  try {
+    if (!channel?.topic?.includes('ticket_owner=')) return;
+    if (!channel.topic.includes('ticket_status=open')) return;
+
+    const now = Date.now();
+    const newCloseAt = now + AUTO_CLOSE_MS;
+
+    // 更新最後互動時間 + 關閉時間
+    const newTopic = upsertTopicKV(channel.topic, {
+      ticket_last_activity_at: now,
+      ticket_close_at: newCloseAt,
+    });
+
+    // 沒變就不做事
+    if (newTopic === channel.topic) return;
+
+    await channel.setTopic(newTopic).catch(() => {});
+    scheduleAutoClose(channel); // ✅ 重新排程自動關閉
+  } catch (e) {
+    console.error('❌ bumpTicketActivity failed:', e);
+  }
+}
+
+
 async function createTicketChannel(guild, member, categoryValue) {
   const opt = TICKET_OPTIONS.find(o => o.value === categoryValue);
   const safeName = member.user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10) || 'user';
@@ -404,3 +433,23 @@ client.on(Events.InteractionCreate, async (i) => {
 });
 
 client.login(DISCORD_TOKEN).catch(console.error);
+
+client.on(Events.MessageCreate, async (msg) => {
+  try {
+    if (!msg.guild) return;
+    if (msg.guild.id !== GUILD_ID) return;
+    if (msg.author?.bot) return;
+
+    const ch = msg.channel;
+    if (!ch || ch.type !== ChannelType.GuildText) return;
+
+    // 只處理工單頻道
+    if (!ch.topic?.includes('ticket_owner=')) return;
+    if (!ch.topic?.includes('ticket_status=open')) return;
+
+    await bumpTicketActivity(ch);
+  } catch (e) {
+    console.error('❌ MessageCreate handler error:', e);
+  }
+});
+
