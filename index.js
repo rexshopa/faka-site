@@ -373,27 +373,32 @@ client.once(Events.ClientReady, async () => {
 
 client.on(Events.InteractionCreate, async (i) => {
   try {
+    // /panel 指令
     if (i.isChatInputCommand() && i.commandName === 'panel') {
       if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
         return i.reply({ content: '你沒有權限使用此指令。', ephemeral: true });
       }
 
-const embed = new EmbedBuilder()
-  .setTitle('客服服務｜專人處理')
-  .setDescription(
-    [
-      '請在下方選擇服務項目，系統將自動建立客服工單頻道。',
-      '',
-      '💰 **購買方式**：<#' + 1388840198326063174 + '>',
-	  '',
-      '🚦 **輔助狀態**：<#' + 1388840382875566080 + '>',
-	  '',
-      '📢 **更新公告**：<#' + 1388839678156734474 + '>',
-    ].join('\n')
-  )
-  .setThumbnail(PANEL_LOGO_URL);
+      const lines = [
+        '請在下方選擇服務項目，系統將自動建立客服工單頻道。',
+        '',
+        `💰 **購買方式**：${GUIDE_CHANNEL_ID ? `<#${GUIDE_CHANNEL_ID}>` : '（未設定）'}`,
+        '',
+        `🚦 **輔助狀態**：${STATUS_CHANNEL_ID ? `<#${STATUS_CHANNEL_ID}>` : '（未設定）'}`,
+        '',
+        `📢 **更新公告**：${UPDATE_CHANNEL_ID ? `<#${UPDATE_CHANNEL_ID}>` : '（未設定）'}`,
+      ];
 
+      const embed = new EmbedBuilder()
+        .setTitle('客服服務｜專人處理')
+        .setDescription(lines.join('\n'));
 
+      if (PANEL_LOGO_URL) embed.setThumbnail(PANEL_LOGO_URL);
+
+      return i.reply({ embeds: [embed], components: makePanelComponents() });
+    }
+
+    // 下拉選單建立工單
     if (i.isStringSelectMenu() && i.customId === 'ticket_select') {
       await i.deferReply({ ephemeral: true });
 
@@ -411,6 +416,7 @@ const embed = new EmbedBuilder()
       return i.editReply({ content: `✅ 已建立工單：<#${channel.id}>` });
     }
 
+    // 關閉工單按鈕
     if (i.isButton() && i.customId === 'ticket_close') {
       const ch = i.channel;
       if (!ch?.topic?.includes('ticket_owner=')) {
@@ -428,6 +434,7 @@ const embed = new EmbedBuilder()
 
       await i.reply({ content: '✅ 正在關閉工單…', ephemeral: true });
       await closeTicket(ch, i.user.id);
+      return;
     }
   } catch (e) {
     console.error(e);
@@ -439,9 +446,10 @@ const embed = new EmbedBuilder()
   }
 });
 
+
 client.login(DISCORD_TOKEN).catch(console.error);
 
-client.on(Events.MessageCreate, async (msg) => {
+cclient.on(Events.MessageCreate, async (msg) => {
   try {
     if (!msg.guild) return;
     if (msg.guild.id !== GUILD_ID) return;
@@ -450,7 +458,7 @@ client.on(Events.MessageCreate, async (msg) => {
     const ch = msg.channel;
     if (!ch || ch.type !== ChannelType.GuildText) return;
 
-    // 只處理工單頻道
+    // 只處理工單頻道（open 才續命）
     if (!ch.topic?.includes('ticket_owner=')) return;
     if (!ch.topic?.includes('ticket_status=open')) return;
 
@@ -459,4 +467,5 @@ client.on(Events.MessageCreate, async (msg) => {
     console.error('❌ MessageCreate handler error:', e);
   }
 });
+
 
