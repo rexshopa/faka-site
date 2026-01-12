@@ -6,13 +6,13 @@ import {
   SlashCommandBuilder, REST, Routes,
   ChannelType, PermissionsBitField,
   ActionRowBuilder, StringSelectMenuBuilder,
-  ButtonBuilder, ButtonStyle, EmbedBuilder
+  ButtonBuilder, ButtonStyle, EmbedBuilder,
 } from 'discord.js';
 
 const {
   DISCORD_TOKEN, GUILD_ID, SUPPORT_ROLE_ID, TICKET_CATEGORY_ID,
   PANEL_LOGO_URL, GUIDE_CHANNEL_ID, STATUS_CHANNEL_ID, UPDATE_CHANNEL_ID,
-  AUTO_CLOSE_MINUTES, AUTO_DELETE_AFTER_CLOSE_MINUTES
+  AUTO_CLOSE_MINUTES, AUTO_DELETE_AFTER_CLOSE_MINUTES,
 } = process.env;
 
 if (!DISCORD_TOKEN || !GUILD_ID || !SUPPORT_ROLE_ID) {
@@ -20,11 +20,15 @@ if (!DISCORD_TOKEN || !GUILD_ID || !SUPPORT_ROLE_ID) {
   process.exit(1);
 }
 
+const AUTO_CLOSE_MS = Math.max(1, Number(AUTO_CLOSE_MINUTES ?? 60)) * 60_000;
+const AUTO_DELETE_MS = Math.max(0, Number(AUTO_DELETE_AFTER_CLOSE_MINUTES ?? 10)) * 60_000;
+
+// 記憶體計時器（重啟會消失，所以我們把時間也寫進 topic，啟動會重排）
+const closeTimers = new Map();   // channelId -> timeout
+const deleteTimers = new Map();  // channelId -> timeout
+
 process.on('unhandledRejection', console.error);
 process.on('uncaughtException', console.error);
-
-const AUTO_CLOSE_MINS = Number(AUTO_CLOSE_MINUTES || 0); // 0 = 不自動關閉
-const AUTO_DELETE_AFTER_CLOSE_MINS = Number(AUTO_DELETE_AFTER_CLOSE_MINUTES || 0); // 0 = 不自動刪除
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
@@ -62,6 +66,49 @@ function makeCloseButtonRow() {
   return [new ActionRowBuilder().addComponents(closeBtn)];
 }
 
+function makeGuideLinks() {
+  // 你有填就顯示，沒填就跳過
+  const lines = [];
+  if (GUIDE_CHANNEL_ID) lines.push(`📌 購買方式：<#${GUIDE_CHANNEL_ID}>`);
+  if (STATUS_CHANNEL_ID) lines.push(`🟢 輔助狀態：<#${STATUS_CHANNEL_ID}>`);
+  if (UPDATE_CHANNEL_ID) lines.push(`🌐 更新公告：<#${UPDATE_CHANNEL_ID}>`);
+  return lines.length ? lines.join('\n') : null;
+}
+
+function clearTimer(map, channelId) {
+  const t = map.get(channelId);
+  if (t) clearTimeout(t);
+  map.delete(channelId);
+}
+
+function parseTopicValue(topic, key) {
+  // topic 格式：a=b; c=d; ...
+  const m = topic?.match(new RegExp(`${key}=(\\d+)`));
+  return m ? Number(m[1]) : null;
+}
+
+function upsertTopicKV(topic, kv) {
+  // kv: {k: v}
+  let base = (topic ?? '').trim();
+  const pairs = base
+    ? base.split(';').map(s => s.trim()).filter(Boolean)
+    : [];
+
+  const map = new Map();
+  for (const p of pairs) {
+    const idx = p.indexOf('=');
+    if (idx === -1) continue;
+    map.set(p.slice(0, idx).trim(), p.slice(idx + 1).trim());
+  }
+
+  for (const [k, v] of Object.entries(kv)) {
+    map.set(k, String(v));
+  }
+
+  // 保持順序大致可讀
+  return Array.from(map.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
 async function registerCommands() {
   const cmd = new SlashCommandBuilder()
     .setName('panel')
@@ -79,37 +126,97 @@ async function ensureNoOpenTicket(guild, userId) {
   return chans.find(ch =>
     ch?.type === ChannelType.GuildText &&
     ch?.topic?.includes(`ticket_owner=${userId}`) &&
-    !ch?.topic?.includes('ticket_status=closed')
+    ch?.topic?.includes('ticket_status=open')
   );
 }
 
-function isValidSnowflake(id) {
-  return typeof id === 'string' && /^[0-9]{17,20}$/.test(id);
-}
-
-async function closeTicketChannel(channel, closedBy = 'system') {
+async function closeTicket(channel, closedByUserId = null) {
   if (!channel?.topic?.includes('ticket_owner=')) return;
 
-  const ownerId = channel.topic.match(/ticket_owner=(\d+)/)?.[1];
+  // 清掉自動關閉計時器
+  clearTimer(closeTimers, channel.id);
 
-  // 標記關閉
-  if (channel.topic.includes('ticket_status=open')) {
-    await channel.setTopic(channel.topic.replace('ticket_status=open', 'ticket_status=closed'));
-  }
+  const topic = channel.topic ?? '';
+  const ownerId = topic.match(/ticket_owner=(\d+)/)?.[1];
 
-  // 鎖住工單本人發言（保留查看）
+  // 設定狀態 closed + 記錄關閉時間
+  const newTopic = upsertTopicKV(topic, {
+    ticket_status: 'closed',
+    ticket_closed_at: Date.now(),
+  });
+  await channel.setTopic(newTopic).catch(() => {});
+
+  // 讓 owner 不能再發言（但仍可看）
   if (ownerId) {
-    await channel.permissionOverwrites.edit(ownerId, { SendMessages: false });
+    await channel.permissionOverwrites.edit(ownerId, { SendMessages: false }).catch(() => {});
   }
 
-  await channel.send(`✅ 工單已關閉（by ${closedBy}）。如需協助請重新開票。`);
+  const who = closedByUserId ? `<@${closedByUserId}>` : '系統';
+  await channel.send({ content: `✅ 工單已關閉（由 ${who}）。` }).catch(() => {});
 
-  // 可選：延遲刪除
-  if (AUTO_DELETE_AFTER_CLOSE_MINS > 0) {
+  // 排程自動刪除
+  scheduleAutoDelete(channel);
+}
+
+function scheduleAutoDelete(channel) {
+  clearTimer(deleteTimers, channel.id);
+
+  // 0 表示不刪
+  if (!AUTO_DELETE_MS || AUTO_DELETE_MS <= 0) return;
+
+  const topic = channel.topic ?? '';
+  const closedAt = parseTopicValue(topic, 'ticket_closed_at') ?? Date.now();
+  const deleteAt = closedAt + AUTO_DELETE_MS;
+
+  // 把 deleteAt 寫進 topic，重啟也能補排程
+  channel.setTopic(upsertTopicKV(topic, { ticket_delete_at: deleteAt })).catch(() => {});
+
+  const delay = Math.max(1000, deleteAt - Date.now());
+  const t = setTimeout(async () => {
+    try {
+      await channel.send('🧹 此工單將自動刪除以保持整潔。').catch(() => {});
+      await channel.delete('Auto delete closed ticket').catch(() => {});
+    } finally {
+      deleteTimers.delete(channel.id);
+    }
+  }, delay);
+
+  deleteTimers.set(channel.id, t);
+}
+
+function scheduleAutoClose(channel) {
+  clearTimer(closeTimers, channel.id);
+
+  const topic = channel.topic ?? '';
+  const createdAt = parseTopicValue(topic, 'ticket_created_at') ?? Date.now();
+  const closeAt = parseTopicValue(topic, 'ticket_close_at') ?? (createdAt + AUTO_CLOSE_MS);
+
+  // 把 closeAt 寫進 topic
+  channel.setTopic(upsertTopicKV(topic, { ticket_close_at: closeAt })).catch(() => {});
+
+  const delay = Math.max(1000, closeAt - Date.now());
+
+  // 提前 5 分鐘提醒（如果時間夠）
+  const warnMs = 5 * 60_000;
+  const warnDelay = closeAt - warnMs - Date.now();
+  if (warnDelay > 1000) {
     setTimeout(() => {
-      channel.delete('Ticket auto deleted after close').catch(() => {});
-    }, AUTO_DELETE_AFTER_CLOSE_MINS * 60 * 1000);
+      channel.send(`⏰ 提醒：此工單將於約 **5 分鐘後** 自動關閉（無需再回覆可忽略）。`).catch(() => {});
+    }, warnDelay);
   }
+
+  const t = setTimeout(async () => {
+    try {
+      // 如果已經不是 open 就不處理
+      if (!channel.topic?.includes('ticket_status=open')) return;
+      await channel.send('⏳ 此工單已超時，系統將自動關閉。如需再協助請重新開票。').catch(() => {});
+      await closeTicket(channel, null);
+    } finally {
+      closeTimers.delete(channel.id);
+    }
+  }, delay);
+
+  closeTimers.set(channel.id, t);
 }
 
 async function createTicketChannel(guild, member, categoryValue) {
@@ -131,33 +238,48 @@ async function createTicketChannel(guild, member, categoryValue) {
       PermissionsBitField.Flags.SendMessages,
       PermissionsBitField.Flags.ReadMessageHistory,
       PermissionsBitField.Flags.ManageMessages,
+      PermissionsBitField.Flags.ManageChannels,
     ]},
   ];
 
-  const parent = isValidSnowflake(TICKET_CATEGORY_ID) ? TICKET_CATEGORY_ID : null;
+  const createdAt = Date.now();
+  const closeAt = createdAt + AUTO_CLOSE_MS;
+
+  const topic = [
+    `ticket_owner=${member.id}`,
+    `ticket_type=${categoryValue}`,
+    `ticket_status=open`,
+    `ticket_created_at=${createdAt}`,
+    `ticket_close_at=${closeAt}`,
+  ].join('; ');
 
   const channel = await guild.channels.create({
     name,
     type: ChannelType.GuildText,
-    parent,
-    topic: `ticket_owner=${member.id}; ticket_type=${categoryValue}; ticket_status=open`,
+    parent: TICKET_CATEGORY_ID || null,
+    topic,
     permissionOverwrites: overwrites,
   });
 
+  const descLines = [
+    '請依序提供以下資訊，客服會更快處理：',
+    '1) 訂單編號（或付款資訊）',
+	'',
+    '2) 問題截圖/錄影（如有）',
+	'',
+    '3) 你的需求描述（越清楚越好）',
+    '',
+    `⏱️ **${Math.round(AUTO_CLOSE_MS / 60000)} 分鐘**內若未完成處理，系統會自動關閉工單。`,
+  ];
+
+  const guideLinks = makeGuideLinks();
+  if (guideLinks) descLines.push('', guideLinks);
+
   const intro = new EmbedBuilder()
     .setTitle(`客服工單：${opt?.label ?? categoryValue}`)
-    .setDescription(
-      [
-        '請依序提供以下資訊，客服會更快處理：',
-        '1) 訂單編號（或付款資訊）',
-		'',
-        '2) 問題截圖/錄影（如有）',
-		'',
-        '3) 你的需求描述（越清楚越好）',
-        '',
-        '📌 注意：請勿在工單內公開敏感資訊（例如完整付款帳密）。'
-      ].join('\n')
-    );
+    .setDescription(descLines.join('\n'));
+
+  if (PANEL_LOGO_URL) intro.setThumbnail(PANEL_LOGO_URL);
 
   await channel.send({
     content: `<@${member.id}> <@&${SUPPORT_ROLE_ID}>`,
@@ -165,18 +287,41 @@ async function createTicketChannel(guild, member, categoryValue) {
     components: makeCloseButtonRow(),
   });
 
-  // 置頂提示（Pin）
-  const pinned = await channel.send('📌 **請先貼上：訂單號 / 問題描述 / 截圖（如有）**，客服會更快處理。');
-  await pinned.pin().catch(() => {});
-
-  // 自動關閉（從建立開始算）
-  if (AUTO_CLOSE_MINS > 0) {
-    setTimeout(() => {
-      closeTicketChannel(channel, 'auto-close').catch(() => {});
-    }, AUTO_CLOSE_MINS * 60 * 1000);
-  }
+  // 排程自動關閉
+  scheduleAutoClose(channel);
 
   return channel;
+}
+
+async function rescheduleAllTickets() {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const chans = await guild.channels.fetch();
+
+  const ticketChannels = chans.filter(ch =>
+    ch?.type === ChannelType.GuildText &&
+    ch?.topic?.includes('ticket_owner=')
+  );
+
+  for (const ch of ticketChannels.values()) {
+    // open -> 排程自動關閉
+    if (ch.topic?.includes('ticket_status=open')) {
+      scheduleAutoClose(ch);
+    }
+
+    // closed -> 排程自動刪除（如果有設定 delete）
+    if (ch.topic?.includes('ticket_status=closed')) {
+      const deleteAt = parseTopicValue(ch.topic, 'ticket_delete_at');
+      const closedAt = parseTopicValue(ch.topic, 'ticket_closed_at');
+
+      // 如果沒有 deleteAt 但有 closedAt，補上 deleteAt 後排程
+      if (!deleteAt && closedAt && AUTO_DELETE_MS > 0) {
+        scheduleAutoDelete(ch);
+      } else if (deleteAt && AUTO_DELETE_MS > 0) {
+        // 直接照 deleteAt 排
+        scheduleAutoDelete(ch);
+      }
+    }
+  }
 }
 
 client.once(Events.ClientReady, async () => {
@@ -187,40 +332,32 @@ client.once(Events.ClientReady, async () => {
   } catch (e) {
     console.error('❌ Register commands failed:', e);
   }
+
+  // 啟動後補排程（避免重啟後計時失效）
+  try {
+    await rescheduleAllTickets();
+    console.log('✅ Ticket timers rescheduled');
+  } catch (e) {
+    console.error('❌ Reschedule failed:', e);
+  }
 });
 
 client.on(Events.InteractionCreate, async (i) => {
   try {
-    // /panel
     if (i.isChatInputCommand() && i.commandName === 'panel') {
       if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
         return i.reply({ content: '你沒有權限使用此指令。', ephemeral: true });
       }
 
-      const guide = GUIDE_CHANNEL_ID ? `<#${GUIDE_CHANNEL_ID}>` : '（未設定）';
-      const status = STATUS_CHANNEL_ID ? `<#${STATUS_CHANNEL_ID}>` : '（未設定）';
-      const updates = UPDATE_CHANNEL_ID ? `<#${UPDATE_CHANNEL_ID}>` : '（未設定）';
-
       const embed = new EmbedBuilder()
         .setTitle('客服服務｜專人處理')
-        .setDescription(
-          [
-            `💰 **購買方式**：${guide}`,
-			'',
-            `🚦 **輔助狀態**：${status}`,
-			'',
-            `📩 **更新公告**：${updates}`,
-            '',
-            '請在下方選擇服務項目，系統將自動建立 **客服工單頻道**。',
-          ].join('\n')
-        );
+        .setDescription('請在下方選擇服務項目，系統將自動建立客服工單頻道。');
 
       if (PANEL_LOGO_URL) embed.setThumbnail(PANEL_LOGO_URL);
 
       return i.reply({ embeds: [embed], components: makePanelComponents() });
     }
 
-    // 下拉選單：開票
     if (i.isStringSelectMenu() && i.customId === 'ticket_select') {
       await i.deferReply({ ephemeral: true });
 
@@ -233,22 +370,11 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       const categoryValue = i.values?.[0];
+      const channel = await createTicketChannel(guild, member, categoryValue);
 
-      try {
-        const channel = await createTicketChannel(guild, member, categoryValue);
-        return i.editReply({ content: `✅ 已建立工單：<#${channel.id}>` });
-      } catch (err) {
-        console.error('❌ createTicketChannel failed:', err);
-        const msg =
-          err?.rawError?.errors?.parent_id?._errors?.[0]?.message ||
-          err?.rawError?.message ||
-          err?.message ||
-          String(err);
-        return i.editReply({ content: `❌ 開票失敗：${msg}`.slice(0, 1800) });
-      }
+      return i.editReply({ content: `✅ 已建立工單：<#${channel.id}>` });
     }
 
-    // 關閉按鈕
     if (i.isButton() && i.customId === 'ticket_close') {
       const ch = i.channel;
       if (!ch?.topic?.includes('ticket_owner=')) {
@@ -264,8 +390,8 @@ client.on(Events.InteractionCreate, async (i) => {
         return i.reply({ content: '你沒有權限關閉此工單。', ephemeral: true });
       }
 
-      await closeTicketChannel(ch, i.user.tag);
-      return i.reply({ content: '✅ 已關閉此工單。', ephemeral: true });
+      await i.reply({ content: '✅ 正在關閉工單…', ephemeral: true });
+      await closeTicket(ch, i.user.id);
     }
   } catch (e) {
     console.error(e);
