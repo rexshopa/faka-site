@@ -378,14 +378,21 @@ client.on(Events.InteractionCreate, async (i) => {
         return i.reply({ content: '你沒有權限使用此指令。', ephemeral: true });
       }
 
-      const embed = new EmbedBuilder()
-        .setTitle('客服服務｜專人處理')
-        .setDescription('請在下方選擇服務項目，系統將自動建立客服工單頻道。');
+const embed = new EmbedBuilder()
+  .setTitle('客服服務｜專人處理')
+  .setDescription(
+    [
+      '請在下方選擇服務項目，系統將自動建立客服工單頻道。',
+      '',
+      '💰 **購買方式**：<#' + 1388840198326063174 + '>',
+	  '',
+      '🚦 **輔助狀態**：<#' + 1388840382875566080 + '>',
+	  '',
+      '📢 **更新公告**：<#' + 1388839678156734474 + '>',
+    ].join('\n')
+  )
+  .setThumbnail(PANEL_LOGO_URL);
 
-      if (PANEL_LOGO_URL) embed.setThumbnail(PANEL_LOGO_URL);
-
-      return i.reply({ embeds: [embed], components: makePanelComponents() });
-    }
 
     if (i.isStringSelectMenu() && i.customId === 'ticket_select') {
       await i.deferReply({ ephemeral: true });
