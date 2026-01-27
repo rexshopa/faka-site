@@ -19,9 +19,7 @@ import {
   EmbedBuilder,
 } from "discord.js";
 
-// =====================
-// ENV
-// =====================
+// ========= ENV =========
 const {
   // discord
   DISCORD_TOKEN,
@@ -40,7 +38,10 @@ const {
   AUTO_DELETE_AFTER_CLOSE_MINUTES,
 
   // web api
+  PORT,
   API_SECRET,
+
+  // tier roles
   ROLE_MEMBER_ID,
   ROLE_VIP_ID,
   ROLE_SUPREME_ID,
@@ -48,7 +49,7 @@ const {
   THRESHOLD_VIP,
   THRESHOLD_SUPREME,
 
-  // member buttons (website)
+  // website links
   SITE_BASE_URL,
   MEMBER_CONNECT_PATH,
   MEMBER_REFRESH_PATH,
@@ -59,38 +60,10 @@ if (!DISCORD_TOKEN || !GUILD_ID || !SUPPORT_ROLE_ID) {
   process.exit(1);
 }
 
-// =====================
-// Koyeb/Render health check: 先開 HTTP，避免 SIGTERM
-// =====================
-const app = express();
-app.use(express.json());
-
-app.get("/", (req, res) => res.status(200).send("OK"));
-
-const listenPort = Number(process.env.PORT || 8000);
-app.listen(listenPort, "0.0.0.0", () => {
-  console.log(`✅ Web API listening on :${listenPort}`);
-});
-
-// =====================
-// Discord Client
-// =====================
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages, // 續命：有人回覆就延長
-    GatewayIntentBits.MessageContent, // 讓 MessageCreate 更穩（有些環境需要）
-  ],
-  partials: [Partials.Channel],
-});
-
-// =====================
-// Ticket timers
-// =====================
+// ========= Timers =========
 const AUTO_CLOSE_MS = Math.max(1, Number(AUTO_CLOSE_MINUTES ?? 60)) * 60_000;
 const AUTO_DELETE_MS =
   Math.max(0, Number(AUTO_DELETE_AFTER_CLOSE_MINUTES ?? 10)) * 60_000;
@@ -129,9 +102,81 @@ function upsertTopicKV(topic, kv) {
     .join("; ");
 }
 
-// =====================
-// Ticket options
-// =====================
+// ========= Discord Client =========
+// ✅ 用最少 intents，避免 Used disallowed intents
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+  partials: [Partials.Channel],
+});
+
+// ========= Web API (WooCommerce sync) =========
+const app = express();
+app.use(express.json());
+
+function auth(req, res, next) {
+  const secret = req.header("X-API-Secret");
+  if (!API_SECRET || secret !== API_SECRET) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  next();
+}
+
+function pickTierRole(totalSpent) {
+  const spent = Number(totalSpent ?? 0);
+
+  const tSup = Number(THRESHOLD_SUPREME ?? 10000);
+  const tVip = Number(THRESHOLD_VIP ?? 4000);
+  const tMem = Number(THRESHOLD_MEMBER ?? 0);
+
+  if (ROLE_SUPREME_ID && spent >= tSup) return ROLE_SUPREME_ID;
+  if (ROLE_VIP_ID && spent >= tVip) return ROLE_VIP_ID;
+  if (ROLE_MEMBER_ID && spent >= tMem) return ROLE_MEMBER_ID;
+
+  return null;
+}
+
+// 官網呼叫：帶 discordUserId + totalSpent（累積消費）
+app.post("/sync-role", auth, async (req, res) => {
+  try {
+    const { discordUserId, totalSpent } = req.body || {};
+    if (!discordUserId)
+      return res.status(400).json({ ok: false, error: "missing discordUserId" });
+
+    const targetRoleId = pickTierRole(totalSpent);
+    if (!targetRoleId)
+      return res.status(400).json({ ok: false, error: "no tier role matched" });
+
+    const guild = await client.guilds.fetch(GUILD_ID);
+
+    // ✅ 不依賴 GuildMembers intent：直接 fetch 成員（走 REST）
+    const member = await guild.members.fetch(discordUserId).catch(() => null);
+    if (!member)
+      return res.status(404).json({ ok: false, error: "member not found in guild" });
+
+    const tierRoles = [ROLE_MEMBER_ID, ROLE_VIP_ID, ROLE_SUPREME_ID].filter(Boolean);
+
+    // 先移除其他階級
+    for (const rid of tierRoles) {
+      if (rid !== targetRoleId && member.roles.cache.has(rid)) {
+        await member.roles.remove(rid).catch(() => {});
+      }
+    }
+    // 再加入目標階級
+    if (!member.roles.cache.has(targetRoleId)) {
+      await member.roles.add(targetRoleId).catch(() => {});
+    }
+
+    return res.json({ ok: true, targetRoleId });
+  } catch (e) {
+    console.error("❌ /sync-role error:", e);
+    return res.status(500).json({ ok: false, error: "server error" });
+  }
+});
+
+// health check
+app.get("/", (req, res) => res.status(200).send("OK"));
+
+// ========= Ticket Config =========
 const TICKET_OPTIONS = [
   { label: "售前問題", value: "pre_sale", description: "購買/付款/商品諮詢等" },
   { label: "售後問題", value: "after_sale", description: "商品使用/遠端/售後問題" },
@@ -141,9 +186,6 @@ const TICKET_OPTIONS = [
   { label: "人工解碼服務", value: "decode", description: "解機碼/人工處理" },
 ];
 
-// =====================
-// UI builders
-// =====================
 function makePanelComponents() {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("ticket_select")
@@ -176,53 +218,45 @@ function makeGuideLinks() {
   return lines.length ? lines.join("\n") : null;
 }
 
-// 會員按鈕：讓客人自己點（你要的那種）
+// ========= Member Panel UI =========
 function buildSiteUrl(path, userId) {
   const base = (SITE_BASE_URL || "").replace(/\/$/, "");
-  const p = (path || "/").startsWith("/") ? path : `/${path}`;
-  return `${base}${p}?discordUserId=${encodeURIComponent(userId)}`;
+  const p = (path || "").startsWith("/") ? path : `/${path || ""}`;
+
+  // ✅ 帶 discordUserId 方便官網接住（官網可不用）
+  const u = `${base}${p}`;
+  if (!userId) return u;
+  const joinChar = u.includes("?") ? "&" : "?";
+  return `${u}${joinChar}discordUserId=${encodeURIComponent(userId)}`;
 }
 
 function makeMemberPanelRow(userId) {
-  const connectUrl = SITE_BASE_URL
-    ? buildSiteUrl(MEMBER_CONNECT_PATH || "/member/connect", userId)
-    : null;
+  const connectUrl = buildSiteUrl(MEMBER_CONNECT_PATH || "/member/connect", userId);
+  const refreshUrl = buildSiteUrl(MEMBER_REFRESH_PATH || "/member/refresh", userId);
 
-  const refreshUrl = SITE_BASE_URL
-    ? buildSiteUrl(MEMBER_REFRESH_PATH || "/member/refresh", userId)
-    : null;
-
-  const connectBtn = new ButtonBuilder()
-    .setLabel("獲取會員")
+  // ✅ Link Button：客人按了直接開官網
+  const getBtn = new ButtonBuilder()
     .setStyle(ButtonStyle.Link)
-    .setURL(connectUrl || "https://example.com");
+    .setLabel("獲取會員")
+    .setURL(connectUrl);
 
   const refreshBtn = new ButtonBuilder()
-    .setLabel("更新會員狀態")
     .setStyle(ButtonStyle.Link)
-    .setURL(refreshUrl || "https://example.com");
+    .setLabel("更新會員狀態")
+    .setURL(refreshUrl);
 
-  // 若你沒填 SITE_BASE_URL，就提示
-  if (!SITE_BASE_URL) {
-    connectBtn.setLabel("請先設定 SITE_BASE_URL").setURL("https://example.com");
-    refreshBtn.setLabel("請先設定 SITE_BASE_URL").setURL("https://example.com");
-  }
-
-  return [new ActionRowBuilder().addComponents(connectBtn, refreshBtn)];
+  return [new ActionRowBuilder().addComponents(getBtn, refreshBtn)];
 }
 
-// =====================
-// Slash commands
-// =====================
+// ========= Slash Commands =========
 async function registerCommands() {
   const cmds = [
     new SlashCommandBuilder()
       .setName("panel")
       .setDescription("在此頻道發送客服工單面板（管理員用）"),
-
     new SlashCommandBuilder()
       .setName("memberpanel")
-      .setDescription("在此頻道發送會員按鈕（管理員用）"),
+      .setDescription("在此頻道發送會員獲取/更新按鈕（管理員用）"),
   ];
 
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
@@ -231,9 +265,7 @@ async function registerCommands() {
   });
 }
 
-// =====================
-// Tickets
-// =====================
+// ========= Tickets =========
 async function ensureNoOpenTicket(guild, userId) {
   const chans = await guild.channels.fetch();
   return chans.find(
@@ -244,8 +276,35 @@ async function ensureNoOpenTicket(guild, userId) {
   );
 }
 
-async function scheduleAutoDelete(channel) {
+async function closeTicket(channel, closedByUserId = null) {
+  if (!channel?.topic?.includes("ticket_owner=")) return;
+
+  clearTimer(closeTimers, channel.id);
+
+  const topic = channel.topic ?? "";
+  const ownerId = topic.match(/ticket_owner=(\d+)/)?.[1];
+
+  const newTopic = upsertTopicKV(topic, {
+    ticket_status: "closed",
+    ticket_closed_at: Date.now(),
+  });
+  await channel.setTopic(newTopic).catch(() => {});
+
+  if (ownerId) {
+    await channel.permissionOverwrites
+      .edit(ownerId, { SendMessages: false })
+      .catch(() => {});
+  }
+
+  const who = closedByUserId ? `<@${closedByUserId}>` : "系統";
+  await channel.send({ content: `✅ 工單已關閉（由 ${who}）。` }).catch(() => {});
+
+  scheduleAutoDelete(channel);
+}
+
+function scheduleAutoDelete(channel) {
   clearTimer(deleteTimers, channel.id);
+
   if (!AUTO_DELETE_MS || AUTO_DELETE_MS <= 0) return;
 
   const topic = channel.topic ?? "";
@@ -265,30 +324,6 @@ async function scheduleAutoDelete(channel) {
   }, delay);
 
   deleteTimers.set(channel.id, t);
-}
-
-async function closeTicket(channel, closedByUserId = null) {
-  if (!channel?.topic?.includes("ticket_owner=")) return;
-
-  clearTimer(closeTimers, channel.id);
-
-  const topic = channel.topic ?? "";
-  const ownerId = topic.match(/ticket_owner=(\d+)/)?.[1];
-
-  const newTopic = upsertTopicKV(topic, {
-    ticket_status: "closed",
-    ticket_closed_at: Date.now(),
-  });
-  await channel.setTopic(newTopic).catch(() => {});
-
-  if (ownerId) {
-    await channel.permissionOverwrites.edit(ownerId, { SendMessages: false }).catch(() => {});
-  }
-
-  const who = closedByUserId ? `<@${closedByUserId}>` : "系統";
-  await channel.send({ content: `✅ 工單已關閉（由 ${who}）。` }).catch(() => {});
-
-  await scheduleAutoDelete(channel);
 }
 
 function scheduleAutoClose(channel) {
@@ -316,7 +351,9 @@ function scheduleAutoClose(channel) {
   const t = setTimeout(async () => {
     try {
       if (!channel.topic?.includes("ticket_status=open")) return;
-      await channel.send("⏳ 此工單已超時，系統將自動關閉。如需再協助請重新開票。").catch(() => {});
+      await channel
+        .send("⏳ 此工單已超時，系統將自動關閉。如需再協助請重新開票。")
+        .catch(() => {});
       await closeTicket(channel, null);
     } finally {
       closeTimers.delete(channel.id);
@@ -326,38 +363,16 @@ function scheduleAutoClose(channel) {
   closeTimers.set(channel.id, t);
 }
 
-async function bumpTicketActivity(channel) {
-  try {
-    if (!channel?.topic?.includes("ticket_owner=")) return;
-    if (!channel.topic.includes("ticket_status=open")) return;
-
-    const now = Date.now();
-    const newCloseAt = now + AUTO_CLOSE_MS;
-
-    const newTopic = upsertTopicKV(channel.topic, {
-      ticket_last_activity_at: now,
-      ticket_close_at: newCloseAt,
-    });
-
-    if (newTopic === channel.topic) return;
-
-    await channel.setTopic(newTopic).catch(() => {});
-    scheduleAutoClose(channel);
-  } catch (e) {
-    console.error("❌ bumpTicketActivity failed:", e);
-  }
-}
-
-async function createTicketChannel(guild, member, categoryValue) {
+async function createTicketChannel(guild, user, categoryValue) {
   const opt = TICKET_OPTIONS.find((o) => o.value === categoryValue);
   const safeName =
-    member.user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 10) || "user";
+    user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 10) || "user";
   const name = `ticket-${safeName}`;
 
   const overwrites = [
     { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
     {
-      id: member.id,
+      id: user.id,
       allow: [
         PermissionsBitField.Flags.ViewChannel,
         PermissionsBitField.Flags.SendMessages,
@@ -382,7 +397,7 @@ async function createTicketChannel(guild, member, categoryValue) {
   const closeAt = createdAt + AUTO_CLOSE_MS;
 
   const topic = [
-    `ticket_owner=${member.id}`,
+    `ticket_owner=${user.id}`,
     `ticket_type=${categoryValue}`,
     `ticket_status=open`,
     `ticket_created_at=${createdAt}`,
@@ -418,7 +433,7 @@ async function createTicketChannel(guild, member, categoryValue) {
   if (PANEL_LOGO_URL) intro.setThumbnail(PANEL_LOGO_URL);
 
   await channel.send({
-    content: `<@${member.id}> <@&${SUPPORT_ROLE_ID}>`,
+    content: `<@${user.id}> <@&${SUPPORT_ROLE_ID}>`,
     embeds: [intro],
     components: makeCloseButtonRow(),
   });
@@ -436,87 +451,26 @@ async function rescheduleAllTickets() {
   );
 
   for (const ch of ticketChannels.values()) {
-    if (ch.topic?.includes("ticket_status=open")) {
-      scheduleAutoClose(ch);
-    }
+    if (ch.topic?.includes("ticket_status=open")) scheduleAutoClose(ch);
     if (ch.topic?.includes("ticket_status=closed")) {
-      await scheduleAutoDelete(ch);
-    }
-  }
-}
-
-// =====================
-// Web API: 官網同步身分組（安全：X-API-Secret）
-// =====================
-function auth(req, res, next) {
-  const secret = req.header("X-API-Secret");
-  if (!API_SECRET || secret !== API_SECRET) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  next();
-}
-
-function pickTierRole(totalSpent) {
-  const spent = Number(totalSpent ?? 0);
-
-  const tSup = Number(THRESHOLD_SUPREME ?? 3000);
-  const tVip = Number(THRESHOLD_VIP ?? 1000);
-  const tMem = Number(THRESHOLD_MEMBER ?? 0);
-
-  if (ROLE_SUPREME_ID && spent >= tSup) return ROLE_SUPREME_ID;
-  if (ROLE_VIP_ID && spent >= tVip) return ROLE_VIP_ID;
-  if (ROLE_MEMBER_ID && spent >= tMem) return ROLE_MEMBER_ID;
-
-  return null;
-}
-
-// 官網呼叫：POST /sync-role
-// Header: X-API-Secret: 你的API_SECRET
-// Body: { discordUserId: "xxxx", totalSpent: 1234 }
-app.post("/sync-role", auth, async (req, res) => {
-  try {
-    const { discordUserId, totalSpent } = req.body || {};
-    if (!discordUserId) {
-      return res.status(400).json({ ok: false, error: "missing discordUserId" });
-    }
-
-    const targetRoleId = pickTierRole(totalSpent);
-    if (!targetRoleId) {
-      return res.status(400).json({ ok: false, error: "no tier role matched" });
-    }
-
-    const guild = await client.guilds.fetch(GUILD_ID);
-    const member = await guild.members.fetch(discordUserId).catch(() => null);
-    if (!member) {
-      return res.status(404).json({ ok: false, error: "member not found in guild" });
-    }
-
-    const tierRoles = [ROLE_MEMBER_ID, ROLE_VIP_ID, ROLE_SUPREME_ID].filter(Boolean);
-
-    // 移除其他階級
-    for (const rid of tierRoles) {
-      if (rid !== targetRoleId && member.roles.cache.has(rid)) {
-        await member.roles.remove(rid).catch(() => {});
+      const deleteAt = parseTopicValue(ch.topic, "ticket_delete_at");
+      const closedAt = parseTopicValue(ch.topic, "ticket_closed_at");
+      if ((!deleteAt && closedAt && AUTO_DELETE_MS > 0) || (deleteAt && AUTO_DELETE_MS > 0)) {
+        scheduleAutoDelete(ch);
       }
     }
-
-    // 加入目標階級
-    if (!member.roles.cache.has(targetRoleId)) {
-      await member.roles.add(targetRoleId);
-    }
-
-    return res.json({ ok: true, targetRoleId });
-  } catch (e) {
-    console.error("❌ /sync-role error:", e);
-    return res.status(500).json({ ok: false, error: "server error" });
   }
-});
+}
 
-// =====================
-// Discord events
-// =====================
+// ========= Events =========
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+
+  // Web API 一定要開（Web Service 需要 port）
+  const listenPort = Number(PORT || 8000);
+  app.listen(listenPort, () => {
+    console.log(`✅ Web API listening on :${listenPort}`);
+  });
 
   try {
     await registerCommands();
@@ -535,7 +489,7 @@ client.once(Events.ClientReady, async () => {
 
 client.on(Events.InteractionCreate, async (i) => {
   try {
-    // 管理員：/panel
+    // ===== /panel 工單面板 =====
     if (i.isChatInputCommand() && i.commandName === "panel") {
       if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
         return i.reply({ content: "你沒有權限使用此指令。", ephemeral: true });
@@ -557,41 +511,39 @@ client.on(Events.InteractionCreate, async (i) => {
       return i.reply({ embeds: [embed], components: makePanelComponents() });
     }
 
-    // 管理員：/memberpanel（你要的「客人自己點」按鈕）
+    // ===== /memberpanel 會員面板 =====
     if (i.isChatInputCommand() && i.commandName === "memberpanel") {
       if (!i.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
         return i.reply({ content: "你沒有權限使用此指令。", ephemeral: true });
       }
 
       const embed = new EmbedBuilder()
-        .setTitle("會員系統")
-        .setDescription("請點擊下方【獲取會員】連接官網會員\n需要更新身分組時再點【更新會員狀態】");
+        .setTitle("會員系統｜自助領取/更新")
+        .setDescription("請點擊下方【獲取會員】連接官網會員，或按【更新會員狀態】同步你的身分組。");
 
-      return i.reply({
-        embeds: [embed],
-        components: makeMemberPanelRow(i.user.id), // 先用發送者的ID（面板放出去後，別人按也會走官網）
-      });
+      if (PANEL_LOGO_URL) embed.setThumbnail(PANEL_LOGO_URL);
+
+      // 這裡放「不帶 userId 的通用按鈕」（所有人都能按）
+      const row = makeMemberPanelRow(null);
+      return i.reply({ embeds: [embed], components: row });
     }
 
-    // select -> create ticket
+    // ===== 下拉選單建立工單 =====
     if (i.isStringSelectMenu() && i.customId === "ticket_select") {
       await i.deferReply({ ephemeral: true });
 
       const guild = await client.guilds.fetch(GUILD_ID);
-      const member = await guild.members.fetch(i.user.id);
 
       const existing = await ensureNoOpenTicket(guild, i.user.id);
-      if (existing) {
-        return i.editReply({ content: `你已經有一張未關閉工單：<#${existing.id}>` });
-      }
+      if (existing) return i.editReply({ content: `你已經有一張未關閉工單：<#${existing.id}>` });
 
       const categoryValue = i.values?.[0];
-      const channel = await createTicketChannel(guild, member, categoryValue);
+      const channel = await createTicketChannel(guild, i.user, categoryValue);
 
       return i.editReply({ content: `✅ 已建立工單：<#${channel.id}>` });
     }
 
-    // close ticket
+    // ===== 關閉工單按鈕 =====
     if (i.isButton() && i.customId === "ticket_close") {
       const ch = i.channel;
       if (!ch?.topic?.includes("ticket_owner=")) {
@@ -621,44 +573,4 @@ client.on(Events.InteractionCreate, async (i) => {
   }
 });
 
-// 訊息續命：有人回覆就延後關閉
-client.on(Events.MessageCreate, async (msg) => {
-  try {
-    if (!msg.guild) return;
-    if (msg.guild.id !== GUILD_ID) return;
-    if (msg.author?.bot) return;
-
-    const ch = msg.channel;
-    if (!ch || ch.type !== ChannelType.GuildText) return;
-
-    if (!ch.topic?.includes("ticket_owner=")) return;
-    if (!ch.topic?.includes("ticket_status=open")) return;
-
-    await bumpTicketActivity(ch);
-  } catch (e) {
-    console.error("❌ MessageCreate handler error:", e);
-  }
-});
-
 client.login(DISCORD_TOKEN).catch(console.error);
-
-// ====== 強制發送會員面板（不靠 slash 指令）======
-client.on(Events.ClientReady, async () => {
-  try {
-    const channelId = "1465290363647561825";  // ← 換成你的頻道ID
-    const ch = await client.channels.fetch(channelId);
-
-    const embed = new EmbedBuilder()
-      .setTitle("會員系統")
-      .setDescription("請點擊下方按鈕連接官網會員 / 更新身分組");
-
-    await ch.send({
-      embeds: [embed],
-      components: makeMemberPanelRow("0"),
-    });
-
-    console.log("✅ Member panel sent");
-  } catch (e) {
-    console.error("❌ Panel send failed:", e);
-  }
-});
