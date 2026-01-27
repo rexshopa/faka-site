@@ -165,22 +165,27 @@ async function applyTierRoles(guild, discordUserId, totalSpent) {
 // =====================
 // Member UI (徽章 + 面板)
 // =====================
-const EMO_MEMBER = "<:rex_badge_blue:1465290780267511832>";
-const EMO_VIP = "<:rex_badge_purple:1465291084061216886>";
+const EMO_MEMBER  = "<:rex_badge_blue:1465290780267511832>";
+const EMO_VIP     = "<:rex_badge_purple:1465291084061216886>";
 const EMO_SUPREME = "<:badge_no_white:1465292714185855057>";
 
+function toNum(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function buildMemberPanelText() {
-  const tMem = Number(THRESHOLD_MEMBER ?? 0);
-  const tVip = Number(THRESHOLD_VIP ?? 4000);
-  const tSup = Number(THRESHOLD_SUPREME ?? 10000);
+  const tMem = toNum(THRESHOLD_MEMBER, 0);
+  const tVip = toNum(THRESHOLD_VIP, 4000);
+  const tSup = toNum(THRESHOLD_SUPREME, 10000);
 
   return [
-    "【👑 會員獲得門檻】",
-    `${EMO_MEMBER}  會員（消費額達 **${tMem}** 元）`,
-    `${EMO_VIP}  黃金會員（消費額達 **${tVip}** 元）`,
-    `${EMO_SUPREME}  尊爵會員（消費額達 **${tSup}** 元）`,
+    "【👑 **會員獲得門檻**】",
+    `${EMO_MEMBER}  **會員**（消費額達 **${tMem} 元**）`,
+    `${EMO_VIP}  **黃金會員**（消費額達 **${tVip} 元**）`,
+    `${EMO_SUPREME}  **尊爵會員**（消費額達 **${tSup} 元**）`,
     "",
-    "【💎 會員福利折扣】",
+    "【💎 **會員福利折扣**】",
     "",
     `**${EMO_MEMBER}  會員**`,
     "1. 參加抽獎活動",
@@ -188,22 +193,22 @@ function buildMemberPanelText() {
     "",
     `**${EMO_VIP}  黃金會員**`,
     "1. 參加抽獎活動",
-    "2. 全館商品最高9折優惠",
-    "3. 一般抽獎增加2倍機率",
+    "2. 全館商品最高 **9 折** 優惠",
+    "3. 一般抽獎增加 **2 倍機率**",
     "4. 參加專屬會員抽獎活動",
     "",
     `**${EMO_SUPREME}  尊爵會員**`,
     "1. 參加抽獎活動",
-    "2. 全館商品最高8折優惠",
-    "3. 一般抽獎增加4倍機率",
+    "2. 全館商品最高 **8 折** 優惠",
+    "3. 一般抽獎增加 **4 倍機率**",
     "4. 參加專屬會員抽獎活動",
-    "5. 會員專屬抽獎增加1倍機率",
+    "5. 會員專屬抽獎增加 **1 倍機率**",
     "6. 客服優先服務",
     "7. 每月兩次免費遠端服務",
     "8. 不定時免費卡號",
     "",
-    "【🔖 會員獲得方法】",
-    "⬇️ 請點擊下方【獲取會員】連接官網會員 ⬇️",
+    "【🔖 **會員獲得方法**】",
+    "⬇️ 請點擊下方 **【獲取會員】** 連接官網會員 ⬇️",
   ].join("\n");
 }
 
@@ -236,6 +241,7 @@ function buildMemberGetModal() {
   modal.addComponents(new ActionRowBuilder().addComponents(email));
   return modal;
 }
+
 
 // =====================
 // Ticket system (不靠訊息事件，避免 intents 問題)
@@ -543,7 +549,7 @@ client.on(Events.InteractionCreate, async (i) => {
         .setTitle("REX 輔助商城｜會員系統")
         .setDescription(buildMemberPanelText());
 
-      return i.reply({ embeds: [embed], components: makeMemberPanelRow() });
+      return i.reply({ content: buildMemberPanelText(), components: makeMemberPanelRow() });
     }
 
     // member_get -> modal
