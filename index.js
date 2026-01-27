@@ -78,6 +78,52 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
   partials: [Partials.Channel],
 });
+// =====================
+// API: WP 呼叫來同步身分組
+// =====================
+app.post("/sync-role", async (req, res) => {
+  try {
+    const { discordUserId, totalSpent } = req.body || {};
+    if (!discordUserId) {
+      return res.status(400).json({ ok: false, error: "missing discordUserId" });
+    }
+
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const member = await guild.members.fetch(discordUserId).catch(() => null);
+    if (!member) {
+      return res.status(404).json({ ok: false, error: "member_not_found" });
+    }
+
+    const spent = Number(totalSpent ?? 0);
+
+    const tMem = Number(THRESHOLD_MEMBER ?? 0);
+    const tVip = Number(THRESHOLD_VIP ?? 4000);
+    const tSup = Number(THRESHOLD_SUPREME ?? 10000);
+
+    let targetRole = null;
+    if (spent >= tSup) targetRole = ROLE_SUPREME_ID;
+    else if (spent >= tVip) targetRole = ROLE_VIP_ID;
+    else targetRole = ROLE_MEMBER_ID;
+
+    const tierRoles = [ROLE_MEMBER_ID, ROLE_VIP_ID, ROLE_SUPREME_ID];
+
+    for (const rid of tierRoles) {
+      if (rid !== targetRole && member.roles.cache.has(rid)) {
+        await member.roles.remove(rid).catch(() => {});
+      }
+    }
+
+    if (!member.roles.cache.has(targetRole)) {
+      await member.roles.add(targetRole);
+    }
+
+    return res.json({ ok: true, targetRoleId: targetRole });
+  } catch (e) {
+    console.error("sync-role error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
 
 // =====================
 // Web server for Koyeb healthcheck
