@@ -29,12 +29,14 @@ const {
 
   // Website
   SITE_BASE_URL, // https://rexcheat.com
-  API_SECRET, // 和官網 API 共同的密鑰
+  API_SECRET, // 和官網 API 共同密鑰（Header: X-API-Secret）
 
   // Roles
   ROLE_MEMBER_ID,
   ROLE_VIP_ID,
   ROLE_SUPREME_ID,
+
+  // thresholds (可不填，預設 0/4000/10000)
   THRESHOLD_MEMBER,
   THRESHOLD_VIP,
   THRESHOLD_SUPREME,
@@ -65,26 +67,27 @@ const client = new Client({
 const app = express();
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-function toApiUrl(path) {
-  const base = SITE_BASE_URL.replace(/\/$/, "");
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return `${base}${p}`;
-}
-
-// 官網 WordPress API（下面我會給你 code snippets）
-// - POST /wp-json/rex/v1/discord/link
-// - POST /wp-json/rex/v1/discord/refresh
+// =====================
+// Website endpoints (WordPress API)
+// =====================
 const WP_LINK_ENDPOINT = "/wp-json/rex/v1/discord/link";
 const WP_REFRESH_ENDPOINT = "/wp-json/rex/v1/discord/refresh";
 
+function toApiUrl(path) {
+  const base = String(SITE_BASE_URL).replace(/\/$/, "");
+  const p = String(path).startsWith("/") ? path : `/${path}`;
+  return `${base}${p}`;
+}
+
 async function postJson(url, body) {
+  // Node 18+ usually has global fetch. If your runtime doesn't, upgrade Node to 18/20.
   const r = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-API-Secret": API_SECRET,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body ?? {}),
   });
 
   let data = null;
@@ -138,7 +141,7 @@ async function applyTierRoles(guild, discordUserId, totalSpent) {
   }
   // add target tier
   if (!member.roles.cache.has(targetRoleId)) {
-    await member.roles.add(targetRoleId);
+    await member.roles.add(targetRoleId).catch(() => {});
   }
 
   return { ok: true, targetRoleId };
@@ -177,6 +180,49 @@ function buildMemberGetModal() {
   return modal;
 }
 
+// ✅ 你的徽章（照你給的 ID）
+const EMO_MEMBER = "<:rex_badge_blue:1465290780267511832>";
+const EMO_VIP = "<:rex_badge_purple:1465291084061216886>";
+const EMO_SUPREME = "<:badge_no_white:1465292714185855057>";
+
+function buildMemberPanelText() {
+  const tMem = Number(THRESHOLD_MEMBER ?? 0);
+  const tVip = Number(THRESHOLD_VIP ?? 4000);
+  const tSup = Number(THRESHOLD_SUPREME ?? 10000);
+
+  return [
+    "【👑 會員獲得門檻】",
+    `${EMO_MEMBER}  會員（消費額達 **${tMem}** 元）`,
+    `${EMO_VIP}  黃金會員（消費額達 **${tVip}** 元）`,
+    `${EMO_SUPREME}  尊爵會員（消費額達 **${tSup}** 元）`,
+    "",
+    "【💎 會員福利折扣】",
+    "",
+    `**${EMO_MEMBER}  會員**`,
+    "1. 參加抽獎活動",
+    "2. 聊天大廳",
+    "",
+    `**${EMO_VIP}  黃金會員**`,
+    "1. 參加抽獎活動",
+    "2. 全館商品最高 9 折優惠",
+    "3. 一般抽獎增加 2 倍機率",
+    "4. 參加專屬會員抽獎活動",
+    "",
+    `**${EMO_SUPREME}  尊爵會員**`,
+    "1. 參加抽獎活動",
+    "2. 全館商品最高 8 折優惠",
+    "3. 一般抽獎增加 4 倍機率",
+    "4. 參加專屬會員抽獎活動",
+    "5. 會員專屬抽獎增加 1 倍機率",
+    "6. 客服優先服務",
+    "7. 每月兩次免費遠端服務",
+    "8. 不定時免費卡號",
+    "",
+    "【🔖 會員獲得方法】",
+    "請點擊下方【獲取會員】連接官網會員",
+  ].join("\n");
+}
+
 // =====================
 // Slash commands
 // =====================
@@ -199,6 +245,7 @@ async function registerCommands() {
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
+  // Koyeb Web Service healthcheck
   const listenPort = Number(PORT || 8000);
   app.listen(listenPort, () => console.log(`✅ Web API listening on :${listenPort}`));
 
@@ -219,13 +266,8 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       const embed = new EmbedBuilder()
-        .setTitle("會員系統｜自助領取/更新")
-        .setDescription(
-          [
-            "✅ **獲取會員**：輸入官網註冊信箱，綁定 Discord（只可綁定一次）",
-            "✅ **更新會員狀態**：直接同步你的累積消費 → 自動更新身分組",
-          ].join("\n")
-        );
+        .setTitle("會員系統｜REX 輔助商城")
+        .setDescription(buildMemberPanelText());
 
       return i.reply({ embeds: [embed], components: makeMemberPanelRow() });
     }
@@ -241,17 +283,13 @@ client.on(Events.InteractionCreate, async (i) => {
 
       const email = (i.fields.getTextInputValue("email") || "").trim().toLowerCase();
 
-      // simple email check
       if (!email.includes("@") || email.length < 6) {
         return i.editReply("❌ Email 格式不正確，請重新點【獲取會員】再輸入。");
       }
 
       // call website link api
       const url = toApiUrl(WP_LINK_ENDPOINT);
-      const data = await postJson(url, {
-        discordUserId: i.user.id,
-        email,
-      });
+      const data = await postJson(url, { discordUserId: i.user.id, email });
 
       const totalSpent = Number(data.totalSpent ?? 0);
 
@@ -261,9 +299,7 @@ client.on(Events.InteractionCreate, async (i) => {
         return i.editReply(`❌ 綁定成功，但更新身分組失敗：${applied.error}`);
       }
 
-      return i.editReply(
-        `✅ 綁定成功！已同步累積消費 **${totalSpent}**，身分組已更新。`
-      );
+      return i.editReply(`✅ 綁定成功！已同步累積消費 **${totalSpent}**，身分組已更新。`);
     }
 
     // Button: member_refresh
@@ -286,11 +322,8 @@ client.on(Events.InteractionCreate, async (i) => {
   } catch (e) {
     console.error(e);
     const msg = `❌ 發生錯誤：${e?.message || "請稍後再試"}`;
-    if (i.deferred || i.replied) {
-      i.editReply(msg).catch(() => {});
-    } else {
-      i.reply({ content: msg, ephemeral: true }).catch(() => {});
-    }
+    if (i.deferred || i.replied) i.editReply(msg).catch(() => {});
+    else i.reply({ content: msg, ephemeral: true }).catch(() => {});
   }
 });
 
